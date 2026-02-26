@@ -1,12 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"time"
+
+	"github.com/webview/webview_go"
 )
 
 var (
@@ -53,11 +54,6 @@ button { background: #3daee9; color: white; border: none; padding: 5px 12px; cur
 </div>
 </div>
 <script>
-// SILENT KILL SWITCH: Fires when the browser window/tab is closed
-window.addEventListener('beforeunload', function() {
-navigator.sendBeacon('/quit');
-});
-
 let serverRunning = false;
 function toggleFM() { document.getElementById('sidebar').classList.toggle('open'); }
 
@@ -184,24 +180,29 @@ type PageData struct {
 }
 
 func main() {
+	os.Setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+	os.Setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+	os.Setenv("GDK_BACKEND", "x11") // Keep this if you still need it for Wayland
 	mainTmpl = template.Must(template.New("main").Parse(mainLayout))
 	fmTmpl = template.Must(template.New("fm").Parse(fmLayout))
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { mainTmpl.Execute(w, nil) })
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/fm", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { mainTmpl.Execute(w, nil) })
+
+	mux.HandleFunc("/fm", func(w http.ResponseWriter, r *http.Request) {
 		cwd, _ := os.Getwd()
 		files, _ := os.ReadDir(".")
 		fmTmpl.Execute(w, PageData{Path: cwd, Files: files})
 	})
 
-	http.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
 		home, _ := os.UserHomeDir()
 		os.Chdir(home)
 		http.Redirect(w, r, "/fm", http.StatusSeeOther)
 	})
 
-	http.HandleFunc("/cd", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cd", func(w http.ResponseWriter, r *http.Request) {
 		target := r.URL.Query().Get("path")
 		if target != "" {
 			os.Chdir(target)
@@ -209,44 +210,47 @@ func main() {
 		http.Redirect(w, r, "/fm", http.StatusSeeOther)
 	})
 
-	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Query().Get("path")
 		content, _ := os.ReadFile(path)
 		w.Write(content)
 	})
 
-	http.HandleFunc("/save", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/save", func(w http.ResponseWriter, r *http.Request) {
 		os.WriteFile(r.FormValue("path"), []byte(r.FormValue("content")), 0644)
 	})
 
-	http.HandleFunc("/check", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/check", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Query().Get("path")
-
 		cmd := exec.Command("go", "vet", path)
 		out, _ := cmd.CombinedOutput()
 		w.Write(out)
 	})
 
-	http.HandleFunc("/start-server", func(w http.ResponseWriter, r *http.Request) {
-		if staticServer != nil { return }
+	mux.HandleFunc("/start-server", func(w http.ResponseWriter, r *http.Request) {
+		if staticServer != nil {
+			return
+		}
 		staticServer = &http.Server{Addr: "127.0.0.1:8081", Handler: http.FileServer(http.Dir("."))}
 		go staticServer.ListenAndServe()
 	})
 
-	http.HandleFunc("/stop-server", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/stop-server", func(w http.ResponseWriter, r *http.Request) {
 		if staticServer != nil {
 			staticServer.Close()
 			staticServer = nil
 		}
 	})
 
-	http.HandleFunc("/newfolder", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/newfolder", func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
-		if name != "" { os.Mkdir(name, 0755) }
+		if name != "" {
+			os.Mkdir(name, 0755)
+		}
 		http.Redirect(w, r, "/fm", http.StatusSeeOther)
 	})
 
-	http.HandleFunc("/newfile", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/newfile", func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
 		if name != "" {
 			f, _ := os.Create(name)
@@ -255,26 +259,34 @@ func main() {
 		http.Redirect(w, r, "/fm", http.StatusSeeOther)
 	})
 
-	http.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
-		if name != "" { os.RemoveAll(name) }
+		if name != "" {
+			os.RemoveAll(name)
+		}
 		http.Redirect(w, r, "/fm", http.StatusSeeOther)
 	})
 
-	http.HandleFunc("/quit", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Sanctuary shutting down...")
-		os.Exit(0)
-	})
+	// 1. Bind to the port FIRST. This guarantees the server is ready.
+	listener, err := net.Listen("tcp", "127.0.0.1:8080")
+	if err != nil {
+		panic(err)
+	}
 
-	go openBrowser("http://127.0.0.1:8080")
+	server := &http.Server{Handler: mux}
+	go func() {
+		server.Serve(listener)
+	}()
 
-	http.ListenAndServe("127.0.0.1:8080", nil)
-}
+	// 2. Create and Run the Native Webview
+	debug := true // Set to true so you can right-click -> Inspect Element
+	w := webview.New(debug)
+	defer w.Destroy()
 
-func openBrowser(url string) {
-	time.Sleep(500 * time.Millisecond)
+	w.SetTitle("Go-FM Text Editor")
+	w.SetSize(1200, 800, webview.HintNone)
+	w.Navigate("http://127.0.0.1:8080/")
 
-	cmd := exec.Command("xdg-open", url)
-	cmd.Env = append(os.Environ(), "DISPLAY=:0")
-	cmd.Start()
+	// 3. This blocks the program from exiting until you close the window
+	w.Run()
 }
